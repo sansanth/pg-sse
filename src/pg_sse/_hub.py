@@ -22,9 +22,11 @@ import decimal
 import functools
 import inspect
 import itertools
+import json
 import logging
 import math
 import numbers
+import queue
 import random
 import selectors
 import signal
@@ -75,6 +77,15 @@ _STATEMENT_TIMEOUT = "30s"
 _BACKOFF_START_SECONDS = 0.5
 _BACKOFF_MAX_SECONDS = 30.0
 _bad_cursor = Throttle()  # a cursor that cannot be an SSE id: any client can send one
+# A shared `Ephemeral` sends its changes as NOTIFY on the hub's channel plus this, so they never reach a stream.
+_EPHEMERAL_SUFFIX = "_ephemeral"
+# Postgres refuses a payload of 8000 bytes or more; the margin covers a server encoding other than UTF-8.
+_EPHEMERAL_PAYLOAD_LIMIT = 7900
+# Changes waiting for `publish`. A database that hangs fills it, and a change that finds it full is not sent: it would
+# arrive stale.
+_OUTBOX_SIZE = 1000
+# How long stopping the hub waits for `publish` to send the changes still waiting, such as the clears of users leaving.
+_PUBLISH_DRAIN_SECONDS = 5.0
 # How long a client refused at a cap waits before it retries (the 503's Retry-After).
 _RETRY_AFTER_SECONDS = 30
 # A server reads a stream as soon as it sends the response. One never read (the route raised after making it, or the
@@ -170,13 +181,18 @@ class HubStats:
       behind, since the process started.
     - `listener_connected`: the listener holds its LISTEN right now.
     - `listener_reconnects_total`: how often the listener got its connection back after losing it.
-    - `last_notification_at`: Unix time of the last notification the listener received, or None if none yet.
+    - `last_notification_at`: Unix time of the last notification the listener received on `channel`, or None if none
+      yet. A shared `Ephemeral`'s traffic does not count: this is for noticing that writes stopped waking anyone.
     - `read_errors_total`: streams that failed: `read` or `start` raised, or `read` returned something the hub could
       not send (not an `Event`, data `json.dumps` refuses, a tuple id).
     - `revalidate_errors_total`: runs of a stream's `revalidate` that raised or timed out, and checks that stopped
       for good. A stream they ended is counted in `ended_total.recheck`, not in `read_errors_total`.
     - `ended_total`: goodbyes sent, by reason. A stream whose client left, or that ended with a `final` event or a
       failed `read` or `start`, sent none.
+    - `ephemeral_rejected_total`: messages from another hub's shared `Ephemeral` that were ignored: not JSON, another
+      version, or a name no shared `Ephemeral` on this hub has.
+    - `ephemeral_publish_errors_total`: changes of a shared `Ephemeral` that were not sent: `publish` raised, or
+      too many were waiting for it.
     """
 
     open_streams: int
@@ -188,6 +204,8 @@ class HubStats:
     read_errors_total: int = 0
     ended_total: EndedTotals = EndedTotals()
     revalidate_errors_total: int = 0
+    ephemeral_rejected_total: int = 0
+    ephemeral_publish_errors_total: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,6 +414,7 @@ class Hub:
         revalidate_failures: int | None = 3,
         revalidate_timeout: float = 10.0,
         listen_poll_seconds: float = 1.0,
+        publish: Callable[[str, str], None] | None = None,
     ) -> None:
         if not channel or "\x00" in channel or len(channel.encode()) > 63:
             raise ValueError("channel must be a non-empty identifier of at most 63 bytes")
@@ -429,6 +448,8 @@ class Hub:
             raise ValueError("application_name must be non-empty text")
         if not isinstance(log_owner, bool):
             raise TypeError(f"log_owner must be True or False; got {log_owner!r}")
+        if publish is not None and (not callable(publish) or _is_async(publish)):
+            raise TypeError("publish must be a plain function publish(channel, payload) that sends a NOTIFY")
         if isinstance(read_executor, _NOT_THREADS):
             # A read runs with the caller's context variables, which, like a lambda, cannot leave this interpreter.
             raise ValueError("read_executor must run threads (a ThreadPoolExecutor), not processes or interpreters")
@@ -530,6 +551,24 @@ class Hub:
         self._serials = itertools.count()
         self._serials_lock = threading.Lock()  # `close` takes one from any thread
         self._last_notification_at: float | None = None
+        # Called as `publish(channel, payload)` to send a shared `Ephemeral`'s change to the other hubs, e.g. with
+        # `SELECT pg_notify(%s, %s)`. It runs on a thread of its own, one change at a time, in order.
+        self.publish = publish
+        self._shared: dict[str, Ephemeral] = {}  # shared `Ephemeral`s by name, for what the listener receives
+        # The publisher thread and its queue, made at the first change and again after it stopped (or the process
+        # forked); None ends the thread once it has sent what came before.
+        self._outbox: queue.Queue[str | None] = queue.Queue(_OUTBOX_SIZE)
+        self._publisher: threading.Thread | None = None
+        self._publisher_lock = threading.Lock()  # also for `_publish_errors`, which two threads count
+        self._publish_errors = 0
+        self._publish_failure = Throttle()
+        self._ephemeral_rejected = 0
+        self._ephemeral_rejection = Throttle()
+
+    @property
+    def ephemeral_channel(self) -> str:
+        """The channel shared `Ephemeral` changes are sent on."""
+        return self.channel + _EPHEMERAL_SUFFIX
 
     def stats(self) -> HubStats:
         return HubStats(
@@ -542,6 +581,8 @@ class Hub:
             read_errors_total=self._read_errors,
             ended_total=EndedTotals(**self._ended),
             revalidate_errors_total=self._revalidate_errors,
+            ephemeral_rejected_total=self._ephemeral_rejected,
+            ephemeral_publish_errors_total=self._publish_errors,
         )
 
     def streams(self) -> list[StreamInfo]:
@@ -1100,11 +1141,103 @@ class Hub:
         grace: float = 0.25,
         all_keys: bool = False,
         clock: Callable[[], float] = time.monotonic,
+        shared: bool = False,
     ) -> "Ephemeral":
         """`Ephemeral(self, name, ...)`: per-key signals that lapse unless renewed (typing, presence)."""
         from ._ephemeral import Ephemeral
 
-        return Ephemeral(self, name, ttl=ttl, signal=signal, grace=grace, all_keys=all_keys, clock=clock)
+        return Ephemeral(self, name, ttl=ttl, signal=signal, grace=grace, all_keys=all_keys, clock=clock, shared=shared)
+
+    def _share(self, ephemeral: "Ephemeral") -> None:
+        """Takes a shared `Ephemeral`'s changes from other hubs from now on, and listens for them."""
+        if self.publish is None:
+            raise ValueError(
+                "pg_sse: shared=True needs Hub(publish=...), a function publish(channel, payload) that sends the "
+                "NOTIFY, e.g. with SELECT pg_notify(%s, %s)"
+            )
+        if len(self.ephemeral_channel.encode()) > 63:
+            raise ValueError(
+                f"pg_sse: shared=True sends on {self.ephemeral_channel!r}, over Postgres's 63 bytes for a channel; "
+                f"use a channel of at most {63 - len(_EPHEMERAL_SUFFIX)} bytes"
+            )
+        if ephemeral.name in self._shared:
+            raise ValueError(f"pg_sse: this hub already has a shared Ephemeral named {ephemeral.name!r}")
+        self._shared[ephemeral.name] = ephemeral
+
+    def _send_ephemeral(self, payload: str) -> None:
+        """
+        Queues a shared `Ephemeral`'s change for `publish`. A NOTIFY is a database round trip and `set` is often called
+        on the event loop, so `publish` runs on a thread of its own; one thread, so the other hubs see the changes in
+        the order they were made.
+        """
+        with self._publisher_lock:
+            if self._publisher is None or not self._publisher.is_alive():
+                self._outbox = queue.Queue(_OUTBOX_SIZE)
+                self._publisher = threading.Thread(
+                    target=self._publish_all, args=(self._outbox,), name="pg-sse-publish", daemon=True
+                )
+                self._publisher.start()
+            try:
+                self._outbox.put_nowait(payload)
+                return
+            except queue.Full:
+                pass
+        self._publish_failed(f"{_OUTBOX_SIZE} changes are already waiting for publish", exc_info=False)
+
+    def _publish_all(self, outbox: "queue.Queue[str | None]") -> None:
+        while (payload := outbox.get()) is not None:
+            try:
+                cast(Callable[[str, str], None], self.publish)(self.ephemeral_channel, payload)
+            except Exception:
+                self._publish_failed("publish raised", exc_info=True)
+
+    def _stop_publisher(self) -> None:
+        """
+        Lets the publisher send what is waiting, for up to `_PUBLISH_DRAIN_SECONDS`, and end. A later change starts
+        another.
+        """
+        with self._publisher_lock:
+            thread, outbox, self._publisher = self._publisher, self._outbox, None
+        if thread is None:
+            return
+        give_up_at = time.monotonic() + _PUBLISH_DRAIN_SECONDS
+        with contextlib.suppress(queue.Full):  # a `publish` that hangs: the thread is a daemon, and stops with it
+            outbox.put(None, timeout=_PUBLISH_DRAIN_SECONDS)
+        thread.join(timeout=max(0.0, give_up_at - time.monotonic()))
+
+    def _publish_failed(self, why: str, *, exc_info: bool) -> None:
+        with self._publisher_lock:
+            self._publish_errors += 1
+        if self._publish_failure.ready():
+            logger.warning("pg_sse: a shared ephemeral change was not sent: %s", why, exc_info=exc_info)
+
+    def _receive_ephemeral(self, payload: str) -> None:
+        """
+        A shared `Ephemeral`'s change from the listener, from any hub, this one included: a change made here is applied
+        at once and again when it comes back, so every hub applies them all in the order Postgres delivers them and
+        ends up where the others do. Never raises: it runs on the loop.
+        """
+        try:
+            message = json.loads(payload)
+        except ValueError:
+            message = None
+        if not isinstance(message, dict):
+            self._reject_ephemeral("not a JSON object")
+            return
+        version, name = message.get("v"), message.get("e")
+        if type(version) is not int or version != 1:
+            self._reject_ephemeral(f"version {version!r}, not 1")
+            return
+        target = self._shared.get(name) if isinstance(name, str) else None
+        if target is None:
+            self._reject_ephemeral(f"no shared Ephemeral named {name!r}")
+        elif not target._receive(message):
+            self._reject_ephemeral(f"a malformed message for {name!r}")
+
+    def _reject_ephemeral(self, why: str) -> None:
+        self._ephemeral_rejected += 1
+        if self._ephemeral_rejection.ready():
+            logger.warning("pg_sse: ignored a message on %s: %s", self.ephemeral_channel, why)
 
     def close_all(self) -> None:
         """
@@ -1296,6 +1429,7 @@ class Hub:
         self._thread.start()
 
     def stop(self) -> None:
+        self._stop_publisher()
         thread, self._thread = self._thread, None
         if thread is None:
             return
@@ -1372,6 +1506,7 @@ class Hub:
                         return
                     conn.execute(f"SET statement_timeout = '{_STATEMENT_TIMEOUT}'")
                     conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self.channel)))
+                    sharing = self._listen_shared(conn, False)
                     backoff = _BACKOFF_START_SECONDS
                     if connected_before:
                         self._reconnects += 1
@@ -1387,14 +1522,18 @@ class Hub:
                         ready.register(conn.fileno(), selectors.EVENT_READ)
                         ready.register(wake, selectors.EVENT_READ)
                         while not stop.is_set():
+                            sharing = self._listen_shared(conn, sharing)
                             if time.monotonic() - last_checked >= _KEEPALIVE_QUERY_SECONDS:
                                 conn.execute("SELECT 1")
                                 last_checked = time.monotonic()
                             # Takes what has arrived, including what a query above received; the wait below only
                             # sees the socket.
                             for notification in conn.notifies(timeout=0):
-                                self._last_notification_at = time.time()
-                                self._post(self._notify, notification.payload)
+                                if notification.channel == self.channel:
+                                    self._last_notification_at = time.time()
+                                    self._post(self._notify, notification.payload)
+                                else:
+                                    self._post(self._receive_ephemeral, notification.payload)
                             ready.select(self.listen_poll_seconds)
             except Exception:
                 if stop.is_set():  # `stop` already cleared `listening`; a later start may have set it again
@@ -1404,6 +1543,16 @@ class Hub:
                 connected_before = True
                 stop.wait(backoff * random.uniform(0.5, 1.0))  # noqa: S311 -- reconnect jitter
                 backoff = min(backoff * 2, _BACKOFF_MAX_SECONDS)
+
+    def _listen_shared(self, conn: psycopg.Connection[Any], listening: bool) -> bool:
+        """
+        LISTENs on `ephemeral_channel` once the hub has a shared `Ephemeral`, so a hub without one listens to its own
+        channel only. One made while the listener runs is picked up within `listen_poll_seconds`.
+        """
+        if self._shared and not listening:
+            conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self.ephemeral_channel)))
+            return True
+        return listening
 
 
 @dataclass(slots=True)
