@@ -280,6 +280,18 @@ typing.set(room_id, user_id, on=False)  # they sent the message: removed, wakes
 typing.live(room_id)  # ["ann", "bo"]: who has not lapsed, for the GET the page refetches
 ```
 
+The signals live in this process's memory. With more than one process on the database, pass `shared=True` and give the hub a `publish` function that sends a NOTIFY; each change then reaches the streams on every hub:
+
+```python
+def publish(channel: str, payload: str) -> None:
+    with pool.connection() as conn:  # a psycopg_pool.ConnectionPool; a pooled connection is fine for sending
+        conn.execute("SELECT pg_notify(%s, %s)", (channel, payload))
+
+
+hub = Hub(DIRECT_DATABASE_URL, channel="room_change", publish=publish)
+typing = hub.ephemeral("typing", ttl=8, shared=True)
+```
+
 ## What `hub.sse` does for you
 
 - **Subscribes before the catch-up read**, so a write between the two is a queued wake-up, not a gap.
@@ -330,7 +342,7 @@ Hub(conninfo, channel, *, max_subscribers=500, max_per_owner=5, max_total_per_ow
     max_stream_seconds=900, ping_seconds=(15, 25), reread_seconds=60, json_default=None, end_event=None,
     handle_signals=True, listen_timeout=5.0, resync_spread=2.0, application_name="pg-sse-listener",
     read_executor=None, on_error=None, log_owner=False, revalidate_seconds=15, revalidate_failures=3,
-    revalidate_timeout=10, listen_poll_seconds=1.0)
+    revalidate_timeout=10, listen_poll_seconds=1.0, publish=None)
 ```
 
 One per channel per process.
@@ -350,6 +362,7 @@ One per channel per process.
 - `handle_signals`: chain onto SIGTERM and SIGINT so streams end at once on a deploy. Pass `False` in tests.
 - `listen_timeout`: seconds `lifespan` waits for the first LISTEN before the app starts (`None`: do not wait). A finite number, 0 or more. It never fails startup.
 - `listen_poll_seconds`: how long a quiet listener waits before it checks its stop flag and runs its keepalive query. Leaving `lifespan` wakes it at once, so this is only the fallback; a test can shorten it. A finite number above 0.
+- `publish`: `publish(channel, payload)` sends a NOTIFY for a shared `Ephemeral` (`SELECT pg_notify(%s, %s)`), so the hub opens no connection of its own for sending. A plain function, not an `async def` (`TypeError`). The hub calls it on a thread of its own, one change at a time, in order; up to 1,000 changes wait for it, and one that finds the queue full is dropped and counted. Leaving `lifespan` gives it up to 5 seconds to send what is still waiting, so close the pool it uses after that. Needed only for `shared=True`.
 - `resync_spread`: after the listener connects or reconnects, every stream re-reads. Each waits a random 0 to this many seconds first, so a database that has just come back is not hit by every open stream at once (up to `max_subscribers` reads queued behind your thread pool or connection pool). A notification for the stream's key during the wait starts the resync early (an all-keys stream keeps its time: every notification reaches it, so on a busy channel the first one would end all their waits at once). Any read in the meantime that re-reads everything counts as the resync: every read of a `read(cursor)`, and a quiet re-read. A `read(cursor, wake)` woken by a `hub.wake` signal alone reads at once and still gets its resync at its time. A resync takes no queue slot, so it never ends a busy stream as behind. `0` reads at once. Pings and the periodic re-read are already jittered; this closes the one synchronised burst.
 - `read_executor`: a thread pool (`concurrent.futures.ThreadPoolExecutor`; a `ProcessPoolExecutor` or `InterpreterPoolExecutor` raises `ValueError`, since a read runs with the caller's context variables) for plain (not async) `read` and `start` functions. By default they share asyncio's thread pool (at most 32 threads, also used by everything else that calls `asyncio.to_thread`), so a burst of stream re-reads can starve other work. Give the streams their own bounded pool: `ThreadPoolExecutor(8, thread_name_prefix="sse-read")`. Async reads do not use it, and the hub never shuts it down.
 - `on_error`: `on_error(key, exc)`, or `on_error(key, exc, info)` (a third positional parameter named `info`, or with no default) to also get the stream's `StreamInfo`: its `owner` and `age_seconds`, to tell whose stream failed. A function that takes neither raises `TypeError` when the hub is made. The signature is what `inspect.signature` reports, which follows `functools.wraps`, so a decorated three-argument handler gets three. Called when a stream fails, after the failure is logged: `read` or `start` raised, or `revalidate` failed `revalidate_failures` times in a row, or `read` returned something the hub could not send (not an `Event`, data `json.dumps` refuses, a tuple id). Use it to report to an error tracker. A plain function runs in asyncio's default pool (not `read_executor`, where in an outage it would wait behind the failing reads), and an `async def` one on the loop, each as its own task, so a slow tracker never holds the failed response open, its slot taken, or the loop; leaving `lifespan` waits up to 5 seconds for those still running, then cancels them. An exception either raises is logged and ignored. A failed `read` or `start` ends the stream without a goodbye. A `revalidate` that failed `revalidate_failures` times in a row ends it with the goodbye `recheck`.
@@ -531,7 +544,7 @@ Three things to get right:
 ### `hub.ephemeral` and `Ephemeral`
 
 ```python
-hub.ephemeral(name, *, ttl, signal=None, grace=0.25, all_keys=False, clock=time.monotonic) -> Ephemeral
+hub.ephemeral(name, *, ttl, signal=None, grace=0.25, all_keys=False, clock=time.monotonic, shared=False) -> Ephemeral
 ```
 
 Signals per key that lapse unless renewed (typing, presence), announced with `hub.wake`. `hub.ephemeral(...)` is `Ephemeral(hub, name, ...)`.
@@ -543,19 +556,30 @@ Signals per key that lapse unless renewed (typing, presence), announced with `hu
 | `grace` | The lapse check runs this long after expiry, so it never finds a signal a hair from expiring. |
 | `all_keys` | Passed to `hub.wake`. False by default: ephemeral state is per key, and a view of every key has nothing to show for it. |
 | `clock` | Seconds, monotonic. Replace it in tests. |
+| `shared` | Also send each change to the other hubs on the database, and apply theirs. See below. |
 
 | Method | Behaviour |
 |---|---|
 | `set(key, who, on=True)` | Renews or starts (`on`) or removes (`not on`) `who`'s signal on `key`. Returns whether what a reader sees changed, and wakes the key's streams only then. A renewal returns False. Removing returns True if there was an entry, even one that lapsed a moment ago: someone may have read it before it lapsed. |
 | `clear(key, who=None)` | Removes one `who`, or everyone on `key`. Returns and wakes as `set(..., on=False)` does. |
 | `live(key)` | Who has not lapsed right now, in the order they started. Never lists an expired entry, even if its lapse check has not run. |
-| `reset()` | Forgets every key and signal, and wakes no stream. For a test fixture's clean slate. |
+| `reset()` | Forgets every key and signal, received ones too, and wakes no stream. Tells no other hub. For a test fixture's clean slate. |
 
-`set` and `clear` are safe from any thread; `key` must be a `str`. Each renewal schedules one lapse check with `hub.call_later`; a check that finds the signal renewed leaves it alone, and the renewal's own check handles it later. State lives in this process only, so with several workers a signal set on one is invisible to the streams on the others, and it is lost on restart. While the hub is stopped nothing checks, so entries linger until the next `set` or `clear` for their key (`live` still skips them).
+`set` and `clear` are safe from any thread; `key` must be a `str`. Each renewal schedules one lapse check with `hub.call_later`; a check that finds the signal renewed leaves it alone, and the renewal's own check handles it later. Without `shared`, state lives in this process only, so with several workers a signal set on one is invisible to the streams on the others, and it is lost on restart. While the hub is stopped nothing checks, so entries linger until the next `set` or `clear` for their key (`live` still skips them).
+
+With `shared=True`, `set` and `clear` also send the change through `Hub(publish=...)` as a NOTIFY on `hub.ephemeral_channel` (the hub's channel plus `_ephemeral`), which the hub's listener also LISTENs to once it has a shared `Ephemeral`. Every other hub applies it to its own shared `Ephemeral` of the same name as if it had been made there: its streams for that key wake with its own `signal`, and its `live(key)` lists local and received signals together. A clear on one hub removes the signal everywhere, wherever it was set.
+
+The hub that made a change applies it at once and again when its NOTIFY comes back, so every hub applies the changes in the order Postgres delivers them, and two hubs that change one signal at the same moment end up agreeing. The cost is that a hub that sets and clears one signal within a NOTIFY's round trip shows it again for those few milliseconds.
+
+- A received signal lapses after the sender's `ttl`, counted from when it arrived on the receiver's own clock; no two machines' clocks are compared. A lost message, or a listener reconnect, costs at most one `ttl` of a stale signal: the senders' next renewal or change puts things right, so nothing is replayed.
+- Starting a signal, removing one and `clear` are always sent. A renewal is sent only once the other hubs' copy has less than half its `ttl` left, so a typing signal renewed on every keystroke costs one NOTIFY per half `ttl`.
+- `who` must be a `str` or an `int` (`TypeError`), and a change whose payload would be over 7,900 bytes (Postgres refuses 8,000) raises `ValueError` before anything changes. The payload is JSON: `{"v": 1, "e": name, "k": key, "w": who, "on": bool, "ttl": seconds}`.
+- A message the hub cannot use (not JSON, another version, a name it has no shared `Ephemeral` for, a bad field) is counted in `HubStats.ephemeral_rejected_total` and warned about at most once a minute; it never disturbs the listener. A `publish` that raises is counted in `ephemeral_publish_errors_total` and warned about at most once a minute; the change still holds on this hub.
+- `shared=True` raises `ValueError` without `Hub(publish=...)`, with a second shared `Ephemeral` of the same name on one hub, and with a channel over 53 bytes (the suffix must fit Postgres's 63).
 
 ### `hub.stats`
 
-A frozen `HubStats`: `open_streams`, `refused_total`, `dropped_total`, `listener_connected`, `listener_reconnects_total`, `last_notification_at` (Unix time or `None`), `read_errors_total` (streams that failed: `read` or `start` raised, or `read` returned something that could not be sent) and `revalidate_errors_total` (runs of a `revalidate` that raised or timed out; streams that `revalidate_failures` ended are in `ended_total.recheck`) and `ended_total`, a frozen `EndedTotals` of goodbyes sent by reason: `max_age`, `shutdown`, `revoked`, `behind` and `recheck`. "Streams dropped for being slow" is `dropped_total`; `ended_total.behind` counts the ones that then said so, which leaves out a dropped stream that a close or shutdown reached first, or whose client left. A goodbye is counted once the client took it, so a stream whose client left, or that ended with a `final` event or a failed `read` or `start`, is in none of them. `dataclasses.asdict(hub.stats())` gives all of it as a dict, `ended_total` as a nested one. The `_total` fields only grow, so a metrics exporter can read them on a timer and publish them as counters. They are per process and start at zero. pg-sse ships no exporter code, since people use different ones.
+A frozen `HubStats`: `open_streams`, `refused_total`, `dropped_total`, `listener_connected`, `listener_reconnects_total`, `last_notification_at` (Unix time or `None`; notifications on the hub's channel only, not a shared `Ephemeral`'s), `read_errors_total` (streams that failed: `read` or `start` raised, or `read` returned something that could not be sent) and `revalidate_errors_total` (runs of a `revalidate` that raised or timed out; streams that `revalidate_failures` ended are in `ended_total.recheck`), `ephemeral_rejected_total` and `ephemeral_publish_errors_total` (messages on `ephemeral_channel` that were ignored, and changes of this hub's shared `Ephemeral`s that were not sent) and `ended_total`, a frozen `EndedTotals` of goodbyes sent by reason: `max_age`, `shutdown`, `revoked`, `behind` and `recheck`. "Streams dropped for being slow" is `dropped_total`; `ended_total.behind` counts the ones that then said so, which leaves out a dropped stream that a close or shutdown reached first, or whose client left. A goodbye is counted once the client took it, so a stream whose client left, or that ended with a `final` event or a failed `read` or `start`, is in none of them. `dataclasses.asdict(hub.stats())` gives all of it as a dict, `ended_total` as a nested one. The `_total` fields only grow, so a metrics exporter can read them on a timer and publish them as counters. They are per process and start at zero. pg-sse ships no exporter code, since people use different ones.
 
 ### `hub.streams`
 
@@ -692,11 +716,11 @@ Waiting past `timeout` raises `TimeoutError` naming the frames seen so far; a st
 
 Each process (each uvicorn or gunicorn worker) holds one LISTEN connection and its own caps and counters. Nothing is shared between workers and nothing needs to be: Postgres delivers every notification to every listener, and each worker wakes its own streams. Budget one connection per worker.
 
-The exception is `hub.wake`: it reaches only the streams of the process that calls it, since nothing is written to the database. State that lives in one worker's memory, which includes everything in `hub.ephemeral` (the typing indicator in the inbox example), is invisible to readers on the other workers; keep it where every worker can see it before you run more than one.
+The exception is `hub.wake`: it reaches only the streams of the process that calls it, since nothing is written to the database. State that lives in one worker's memory, which includes a `hub.ephemeral` (the typing indicator in the inbox example), is invisible to readers on the other workers; pass `shared=True` to send its changes to every worker, and keep anything else where every worker can see it before you run more than one.
 
 ## Logging
 
-pg-sse logs to the standard-library logger named `pg_sse` and adds no handlers, so configure it like any other. At `WARNING` it logs a stream refused at a cap or during shutdown (back-pressure, not a fault), the listener losing its connection (with the traceback and the retry delay), and, at most once a minute per hub, a `revalidate` that failed without ending its stream. It also warns, at most once a minute, about a client cursor with a line break or NUL (the stream starts from now) and about an id longer than an `IntCursor`'s `max_digits`. At `ERROR` it logs, with a traceback, a stream whose `read` or `start` raised or returned something other than `Event` items (that stream ends and the client reconnects), naming its key, its owner (if `log_owner=True`) and age; one that a failing `revalidate` ended is logged the same way at most once a minute per hub, and a failed run that ends nothing is a WARNING. It also logs an `on_error` callback that failed.
+pg-sse logs to the standard-library logger named `pg_sse` and adds no handlers, so configure it like any other. At `WARNING` it logs a stream refused at a cap or during shutdown (back-pressure, not a fault), the listener losing its connection (with the traceback and the retry delay), and, at most once a minute per hub, a `revalidate` that failed without ending its stream. It also warns, at most once a minute, about a client cursor with a line break or NUL (the stream starts from now) and about an id longer than an `IntCursor`'s `max_digits`. For a shared `Ephemeral` it warns, at most once a minute each, about a message on `ephemeral_channel` it ignored and about a change it could not send (with the traceback when `publish` raised). At `ERROR` it logs, with a traceback, a stream whose `read` or `start` raised or returned something other than `Event` items (that stream ends and the client reconnects), naming its key, its owner (if `log_owner=True`) and age; one that a failing `revalidate` ended is logged the same way at most once a minute per hub, and a failed run that ends nothing is a WARNING. It also logs an `on_error` callback that failed.
 
 ## Limits
 
@@ -705,7 +729,7 @@ pg-sse logs to the standard-library logger named `pg_sse` and adds no handlers, 
 - **A key is text.** `hub.stream`, `hub.sse`, `hub.subscribe` and `hub.wake` raise a `TypeError` for a key that is not a `str`, because a notification carries the key column as text and an int would subscribe and never wake. Pass `str(room_id)`.
 - **Sync reads run in a thread pool.** A plain-function `read` or `start` runs in asyncio's default executor (`min(32, cpu + 4)` threads) unless you pass `read_executor`, and under Starlette other sync routes share anyio's pool of 40. Hundreds of streams re-reading at once queue behind it. Prefer async `read` and `start` on an `psycopg_pool.AsyncConnectionPool`; see [examples/chat.py](https://github.com/sansanth/pg-sse/blob/main/examples/chat.py). Use `functools.partial(read_after, room)` rather than a lambda to keep an async function off the pool.
 - **`order_column` serialises inserts per key.** The ordering trigger takes `pg_advisory_xact_lock` on the key and holds it until the transaction ends, so every other insert to that key waits for the whole transaction. Two transactions inserting into keys in opposite order can deadlock, and Postgres aborts one of them. Keep the transaction that inserts short, or skip `order_column` and tolerate a late id arriving on the next re-read. The lock is `pg_advisory_xact_lock(hashtext(channel), hashtext(key))`; advisory locks share one namespace per database, so an application taking the same two-int lock would serialise against these inserts, and since `hashtext` is 32-bit two different keys can collide and briefly wait on each other (a delay, never wrong ids).
-- **Ephemeral state is per process.** `hub.ephemeral` keeps its signals in memory: with several workers a signal set on one is invisible to the streams on the others, and a restart loses it. That costs nothing for typing or presence; anything that must be seen everywhere belongs in a table with a trigger.
+- **Ephemeral state is per process unless shared.** `hub.ephemeral` keeps its signals in memory: with several workers a signal set on one is invisible to the streams on the others unless it is `shared=True`, and a restart loses it. That costs nothing for typing or presence; anything that must survive belongs in a table with a trigger.
 - **Per process.** Each worker runs its own listener, which works, but the caps are per process.
 - **The database may be down at startup.** `lifespan` waits up to `listen_timeout` for the first LISTEN and then starts anyway; until the listener connects, streams update on their re-read and `listener_connected` is false.
 - **Disconnect detection depends on the server.** Starlette 1.7 under an ASGI server that advertises `spec_version` 2.4 does not listen for `http.disconnect` during a streaming response: a dead client is noticed at the next write, at most `ping_seconds[1]` later, and its slot is held until then. uvicorn 0.54 advertises 2.3 and frees the slot at once.
