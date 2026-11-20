@@ -11,7 +11,8 @@ so no two machines' clocks are ever compared, and a lost message costs at most o
 Every hub, the sender included, applies the changes in the order Postgres delivers them, so two hubs that change one
 signal at the same moment still agree on the outcome. While a hub's own change to a signal is on its way back (a clear
 of everyone counts for each who), it skips whatever arrives for that signal first, its own older echoes and other
-hubs' changes alike: those come earlier in Postgres's order and would only show for a round trip.
+hubs' changes alike: those come earlier in Postgres's order and would only show for a round trip. After `reset`, the
+echoes of the starts and renewals a hub sent before it are ignored.
 """
 
 import heapq
@@ -84,6 +85,7 @@ class Ephemeral:
         self._pid = os.getpid()
         self._origin = secrets.token_hex(8)
         self._number = 0
+        self._reset_number = 0  # the last change sent before `reset`: an echo up to it that starts a signal is ignored
         self._sent: dict[str, dict[Any, int]] = {}
         self._expiry: list[tuple[float, int, str, Any]] = []
         self.shared = shared
@@ -119,9 +121,11 @@ class Ephemeral:
     def reset(self) -> None:
         """
         Forgets every key and signal, received ones too, without waking any stream or telling other hubs, and makes the
-        lapse checks already scheduled do nothing. For tests: a fixture's clean slate.
+        lapse checks already scheduled do nothing; the echoes of the starts and renewals this instance sent before it
+        are ignored, while other hubs' changes still apply. For tests: a fixture's clean slate.
         """
         with self._lock:
+            self._reset_number = self._number
             self._entries.clear()
             self._told.clear()
             self._sent.clear()
@@ -137,7 +141,9 @@ class Ephemeral:
     def _start(self, key: str, who: Any, ttl: float, *, send: bool, echo: int | None = None) -> bool:
         now = self._clock()
         with self._lock:
-            if echo is not None and self._superseded(key, who, echo):
+            # An own start sent before a `reset` would bring back what it forgot. A removal still applies: in Postgres's
+            # order it may come after another hub's start, as it does on the other hubs.
+            if echo is not None and (0 < echo <= self._reset_number or self._superseded(key, who, echo)):
                 return False
             users = self._entries.setdefault(key, {})
             previous = users.get(who)

@@ -563,7 +563,7 @@ Signals per key that lapse unless renewed (typing, presence), announced with `hu
 | `set(key, who, on=True)` | Renews or starts (`on`) or removes (`not on`) `who`'s signal on `key`. Returns whether what a reader sees changed, and wakes the key's streams only then. A renewal returns False. Removing returns True if there was an entry, even one that lapsed a moment ago: someone may have read it before it lapsed. |
 | `clear(key, who=None)` | Removes one `who`, or everyone on `key`. Returns and wakes as `set(..., on=False)` does. |
 | `live(key)` | Who has not lapsed right now, in the order they started. Never lists an expired entry, even if its lapse check has not run. |
-| `reset()` | Forgets every key and signal, received ones too, and wakes no stream. Tells no other hub. For a test fixture's clean slate. |
+| `reset()` | Forgets every key and signal, received ones too, and wakes no stream. Tells no other hub. A shared one ignores the echoes of the starts and renewals it sent before the reset; changes from other hubs still apply. For a test fixture's clean slate. |
 
 `set` and `clear` are safe from any thread; `key` must be a `str`. Each renewal schedules one lapse check with `hub.call_later`; a check that finds the signal renewed leaves it alone, and the renewal's own check handles it later. Without `shared`, state lives in this process only, so with several workers a signal set on one is invisible to the streams on the others, and it is lost on restart. While the hub is stopped nothing checks, so entries linger until the next `set` or `clear` for their key (`live` still skips them).
 

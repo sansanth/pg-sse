@@ -510,6 +510,59 @@ async def test_reset_forgets_received_signals(db):
         assert typing_b.live("room") == []
 
 
+async def test_reset_ignores_the_echo_of_a_change_sent_before_it(db):
+    clock = Clock()
+    hub, typing, sent = captured(db, clock=clock)
+    typing.set("room", "ann", True)
+    await until(lambda: len(sent) == 1)
+    typing.reset()
+    hub._receive_ephemeral(sent[0])
+    assert typing.live("room") == []
+    other = {**json.loads(sent[0]), "o": "another hub"}  # the same number from another origin
+    hub._receive_ephemeral(json.dumps(other))
+    assert typing.live("room") == ["ann"]
+    typing.set("room", "bob")  # sent after the reset
+    await until(lambda: len(sent) == 2)
+    clock.now += 8  # bob lapsed here before his echo came back, which still applies
+    hub._receive_ephemeral(sent[1])
+    assert typing.live("room") == ["bob"]
+    assert hub.stats().ephemeral_rejected_total == 0
+    hub.stop()
+
+
+@pytest.mark.parametrize("change", ["off", "clear"])
+async def test_a_removal_sent_before_reset_still_applies_when_it_comes_back(db, change):
+    hub, typing, sent = captured(db)
+    if change == "clear":
+        typing.clear("room")
+    else:
+        typing.set("room", "bob", False)
+    await until(lambda: len(sent) == 1)
+    typing.reset()
+    bob = {"v": 1, "e": "typing", "k": "room", "w": "bob", "on": True, "ttl": 8}
+    hub._receive_ephemeral(json.dumps(bob))  # committed before the removal, as on every other hub
+    assert typing.live("room") == ["bob"]
+    hub._receive_ephemeral(sent[0])
+    assert typing.live("room") == []
+    hub.stop()
+
+
+async def test_a_reset_that_lands_while_an_echo_is_applied_still_ignores_it(db):
+    hub, typing, sent = captured(db)
+    typing.set("room", "ann")
+    await until(lambda: len(sent) == 1)
+    start = typing._start
+
+    def reset_then_start(*args, **kwargs):
+        typing.reset()  # as from another thread, once the echo was taken for this instance's own
+        return start(*args, **kwargs)
+
+    with mock.patch.object(typing, "_start", side_effect=reset_then_start):
+        hub._receive_ephemeral(sent[0])
+    assert typing.live("room") == []
+    hub.stop()
+
+
 async def test_leaving_lifespan_sends_what_is_waiting_and_ends_the_publisher(db):
     notify = Notify(db.dsn)
 
