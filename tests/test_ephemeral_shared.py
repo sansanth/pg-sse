@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import threading
 from contextlib import AsyncExitStack
 from unittest import mock
@@ -142,9 +143,11 @@ async def test_two_hubs_that_change_one_signal_at_once_agree_on_the_outcome(db):
     typing_b = b.ephemeral("typing", ttl=8, shared=True)
     async with AsyncExitStack() as stack:
         await running(stack, a, b)
-        typing_b.clear("room", "ann")  # applied on B at once, sent after A's set
-        typing_a.set("room", "ann")
-        await until(lambda: typing_b.live("room") == ["ann"])
+        with mock.patch.object(typing_b, "_receive", wraps=typing_b._receive) as received:
+            typing_b.clear("room", "ann")  # applied on B at once, sent after A's set
+            typing_a.set("room", "ann")
+            await until(lambda: received.call_count == 1)
+        assert typing_b.live("room") == []  # A's set came first: B's clear, on its way, overrides it
         held.set()
         await until(lambda: typing_a.live("room") == [] and typing_b.live("room") == [])  # B's clear came last
         await asyncio.sleep(0.1)
@@ -163,6 +166,157 @@ async def test_a_hubs_own_change_comes_back_and_leaves_it_where_it_was(db):
         assert await subscription.wait(1) == [("wake", "room", "typing")]
         assert not await woken(subscription)
         assert typing_a.live("room") == ["ann"]
+
+
+def captured(db, **kwargs):
+    """A hub whose `publish` only keeps the payloads, to be handed back by the test, and its shared `typing`."""
+    sent: list[str] = []
+    hub = make_hub(db, publish=lambda channel, payload: sent.append(payload))
+    return hub, hub.ephemeral("typing", ttl=8, shared=True, **kwargs), sent
+
+
+@pytest.mark.parametrize(
+    ("changes", "live"),
+    [
+        ("on off", []),
+        ("off on", ["ann"]),
+        ("on clear", []),
+        ("on clear on", ["ann"]),
+        ("clear on off", []),
+    ],
+)
+async def test_the_echo_of_a_change_that_was_followed_by_a_newer_one_is_skipped(db, changes, live):
+    hub, typing, sent = captured(db)
+    for change in changes.split():
+        if change == "clear":
+            typing.clear("room")
+        else:
+            typing.set("room", "ann", change == "on")
+    await until(lambda: len(sent) == len(changes.split()))
+    for payload in sent:
+        hub._receive_ephemeral(payload)
+        assert typing.live("room") == live
+    assert hub.stats().ephemeral_rejected_total == 0
+    hub.stop()
+
+
+async def test_the_echo_of_a_clear_removes_the_others_and_keeps_whom_this_hub_set_again(db):
+    a, typing_a, sent_a = captured(db)
+    b, typing_b, sent_b = captured(db)
+    typing_a.set("room", "ann")
+    typing_b.set("room", "bob")
+    typing_a.clear("room")
+    typing_a.set("room", "ann")
+    await until(lambda: len(sent_a) == 3 and len(sent_b) == 1)
+    # bob's set committed before A's clear, so A never shows him; A shows ann throughout, as it did locally
+    steps = [(sent_a[0], ["ann"], ["bob", "ann"]), (sent_b[0], ["ann"], ["bob", "ann"])]
+    steps += [(sent_a[1], ["ann"], []), (sent_a[2], ["ann"], ["ann"])]
+    for payload, live_a, live_b in steps:
+        a._receive_ephemeral(payload)
+        b._receive_ephemeral(payload)
+        assert (typing_a.live("room"), typing_b.live("room")) == (live_a, live_b)
+    a.stop()
+    b.stop()
+
+
+async def test_two_hubs_that_change_one_signal_end_in_postgres_order(db):
+    a, typing_a, sent_a = captured(db)
+    b, typing_b, sent_b = captured(db)
+    typing_a.set("room", "ann", True)
+    typing_b.set("room", "ann", False)
+    await until(lambda: len(sent_a) == len(sent_b) == 1)
+    # B's NOTIFY committed first: A, whose set is on its way, never shows B's older clear
+    for payload, live_b in ((sent_b[0], []), (sent_a[0], ["ann"])):
+        a._receive_ephemeral(payload)
+        b._receive_ephemeral(payload)
+        assert (typing_a.live("room"), typing_b.live("room")) == (["ann"], live_b)
+    a.stop()
+    b.stop()
+
+
+async def test_a_change_whose_echo_never_comes_is_forgotten_after_a_ttl(db):
+    clock = Clock()
+    hub, typing, sent = captured(db, clock=clock)
+    for who in ("ann", "bob", "cy"):
+        typing.set("room", who)
+    typing.clear("lobby")
+    clock.now += 8
+    typing.set("room", "dee")
+    assert typing._sent == {"room": {"dee": 5}}
+    await until(lambda: len(sent) == 5)
+    hub._receive_ephemeral(sent[0])  # too late to be told apart from anyone else's: applied
+    assert sorted(typing.live("room")) == ["ann", "dee"]
+    hub.stop()
+
+
+async def test_a_change_made_while_the_publisher_drains_is_sent_after_what_it_drains(db):
+    released = threading.Event()
+    sent: list[str] = []
+
+    def publish(channel: str, payload: str) -> None:
+        who = json.loads(payload)["w"]
+        if who == "ann":
+            released.wait(5)
+        sent.append(who)
+
+    hub = make_hub(db, publish=publish)
+    typing = hub.ephemeral("typing", ttl=8, shared=True)
+    typing.set("room", "ann")
+    stopping = threading.Thread(target=hub._stop_publisher)
+    stopping.start()
+    await until(lambda: hub._publisher is None)
+    typing.set("room", "bob")  # a second publisher, while the first still sends ann
+    await asyncio.sleep(0.1)
+    released.set()
+    stopping.join()  # and the stop waits for that one too
+    assert sent == ["ann", "bob"]
+    hub.stop()
+
+
+async def test_a_change_that_was_not_sent_holds_nothing_back(db):
+    def publish(channel: str, payload: str) -> None:
+        raise ConnectionError("database gone")
+
+    hub = make_hub(db, publish=publish)
+    typing = hub.ephemeral("typing", ttl=8, shared=True)
+    typing.set("room", "ann", on=False)
+    await until(lambda: typing._sent == {})
+    other = {"v": 1, "e": "typing", "k": "room", "w": "ann", "on": True, "ttl": 8}
+    hub._receive_ephemeral(json.dumps(other))  # no change of this hub's is on its way to override it
+    assert typing.live("room") == ["ann"]
+    hub.stop()
+
+
+async def test_a_lowered_ttl_forgets_a_later_change_first(db):
+    clock = Clock()
+    hub, typing, _ = captured(db, clock=clock)
+    typing.set("room", "ann")
+    typing.ttl = 1
+    typing.set("room", "bob")
+    clock.now += 1
+    typing.set("room", "cy")
+    assert typing._sent == {"room": {"ann": 1, "cy": 3}}
+    hub.stop()
+
+
+async def test_a_forked_process_does_not_take_its_parents_changes_for_its_own(db):
+    hub, typing, _ = captured(db)
+    parent = typing._origin
+    with mock.patch("pg_sse._ephemeral.os.getpid", return_value=os.getpid() + 1):
+        typing.set("room", "ann", on=False)  # the child's change 1, on its way
+        assert typing._origin != parent
+        message = {"v": 1, "e": "typing", "k": "room", "w": "ann", "on": True, "ttl": 8, "o": parent, "n": 1}
+        hub._receive_ephemeral(json.dumps(message))  # the parent's change 1: older than the child's
+        assert typing.live("room") == []
+    hub.stop()
+
+
+async def test_changes_sent_before_the_listener_listens_are_not_waited_for(db):
+    hub, typing, _ = captured(db)
+    typing.set("room", "ann")
+    assert typing._sent == {"room": {"ann": 1}}
+    async with hub.lifespan():
+        await until(lambda: typing._sent == {})
 
 
 async def test_shared_traffic_is_not_a_notification_in_the_stats(db):
@@ -342,6 +496,7 @@ async def test_a_change_that_finds_too_many_waiting_is_counted_and_dropped(db, m
     await until(lambda: len(sent) == 2)
     assert [json.loads(p)["w"] for p in sent] == ["ann", "bob"]
     assert typing.live("room") == ["ann", "bob", "cy"]
+    assert typing._sent == {"room": {"ann": 1, "bob": 2}}  # cy's change will not come back
     hub.stop()
 
 
