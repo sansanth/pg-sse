@@ -557,8 +557,9 @@ class Hub:
         self._shared: dict[str, Ephemeral] = {}  # shared `Ephemeral`s by name, for what the listener receives
         # The publisher thread and its queue, made at the first change and again after it stopped (or the process
         # forked); None ends the thread once it has sent what came before.
-        self._outbox: queue.Queue[str | None] = queue.Queue(_OUTBOX_SIZE)
+        self._outbox: queue.Queue[tuple[str, Callable[[], None]] | None] = queue.Queue(_OUTBOX_SIZE)
         self._publisher: threading.Thread | None = None
+        self._draining: threading.Thread | None = None  # a stopped publisher still sending what was waiting
         self._publisher_lock = threading.Lock()  # also for `_publish_errors`, which two threads count
         self._publish_errors = 0
         self._publish_failure = Throttle()
@@ -1164,46 +1165,61 @@ class Hub:
             raise ValueError(f"pg_sse: this hub already has a shared Ephemeral named {ephemeral.name!r}")
         self._shared[ephemeral.name] = ephemeral
 
-    def _send_ephemeral(self, payload: str) -> None:
+    def _send_ephemeral(self, payload: str, unsent: Callable[[], None]) -> bool:
         """
         Queues a shared `Ephemeral`'s change for `publish`. A NOTIFY is a database round trip and `set` is often called
         on the event loop, so `publish` runs on a thread of its own; one thread, so the other hubs see the changes in
-        the order they were made.
+        the order they were made. False if the queue is full and the change dropped; `unsent` is called if `publish`
+        raises.
         """
         with self._publisher_lock:
             if self._publisher is None or not self._publisher.is_alive():
                 self._outbox = queue.Queue(_OUTBOX_SIZE)
                 self._publisher = threading.Thread(
-                    target=self._publish_all, args=(self._outbox,), name="pg-sse-publish", daemon=True
+                    target=self._publish_all,
+                    args=(self._outbox, self._draining),
+                    name="pg-sse-publish",
+                    daemon=True,
                 )
+                self._draining = None
                 self._publisher.start()
             try:
-                self._outbox.put_nowait(payload)
-                return
+                self._outbox.put_nowait((payload, unsent))
+                return True
             except queue.Full:
                 pass
         self._publish_failed(f"{_OUTBOX_SIZE} changes are already waiting for publish", exc_info=False)
+        return False
 
-    def _publish_all(self, outbox: "queue.Queue[str | None]") -> None:
-        while (payload := outbox.get()) is not None:
+    def _publish_all(
+        self, outbox: "queue.Queue[tuple[str, Callable[[], None]] | None]", previous: threading.Thread | None
+    ) -> None:
+        if previous is not None:  # it sends older changes: let it finish, or give up as `_stop_publisher` does
+            previous.join(_PUBLISH_DRAIN_SECONDS)
+        while (item := outbox.get()) is not None:
+            payload, unsent = item
             try:
                 cast(Callable[[str, str], None], self.publish)(self.ephemeral_channel, payload)
             except Exception:
                 self._publish_failed("publish raised", exc_info=True)
+                unsent()
 
     def _stop_publisher(self) -> None:
         """
-        Lets the publisher send what is waiting, for up to `_PUBLISH_DRAIN_SECONDS`, and end. A later change starts
-        another.
+        Lets the publisher send what is waiting, for up to `_PUBLISH_DRAIN_SECONDS` in all, and end; and so for one
+        that a change made meanwhile started. A later change starts another.
         """
-        with self._publisher_lock:
-            thread, outbox, self._publisher = self._publisher, self._outbox, None
-        if thread is None:
-            return
         give_up_at = time.monotonic() + _PUBLISH_DRAIN_SECONDS
-        with contextlib.suppress(queue.Full):  # a `publish` that hangs: the thread is a daemon, and stops with it
-            outbox.put(None, timeout=_PUBLISH_DRAIN_SECONDS)
-        thread.join(timeout=max(0.0, give_up_at - time.monotonic()))
+        while (left := give_up_at - time.monotonic()) > 0:
+            with self._publisher_lock:
+                thread, outbox, self._publisher = self._publisher, self._outbox, None
+                if thread is not None:
+                    self._draining = thread
+            if thread is None:
+                return
+            with contextlib.suppress(queue.Full):  # a `publish` that hangs: the thread is a daemon, and stops with it
+                outbox.put(None, timeout=left)
+            thread.join(timeout=max(0.0, give_up_at - time.monotonic()))
 
     def _publish_failed(self, why: str, *, exc_info: bool) -> None:
         with self._publisher_lock:
@@ -1551,6 +1567,8 @@ class Hub:
         """
         if self._shared and not listening:
             conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self.ephemeral_channel)))
+            for ephemeral in list(self._shared.values()):
+                ephemeral._listening()
             return True
         return listening
 

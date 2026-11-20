@@ -5,6 +5,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-20
+
+### Fixed
+
+- A shared `Ephemeral` no longer shows a signal again for a NOTIFY's round trip after `set(key, who, on=False)` or
+  `clear(key)`: while a hub's own change is on its way back, it skips the older changes that arrive for that signal.
+- A shared change made while leaving `lifespan` is sent after the changes that were already waiting, not before them,
+  and `lifespan` waits for it too (within the same 5 s).
+
 ## [0.6.0] - 2026-11-18
 
 ### Added
@@ -196,7 +205,8 @@ First release.
   than `queue_size` distinct keys or signals arrive during one read.
 - Python 3.11+, Postgres 14+, psycopg 3.
 
-[Unreleased]: https://github.com/sansanth/pg-sse/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/sansanth/pg-sse/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/sansanth/pg-sse/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/sansanth/pg-sse/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/sansanth/pg-sse/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/sansanth/pg-sse/compare/v0.3.0...v0.4.0
