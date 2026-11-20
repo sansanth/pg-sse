@@ -5,6 +5,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-11-20
+
+### Fixed
+
+- A shared `Ephemeral`'s `reset()` ignores the echoes of the starts and renewals it sent before, so its own change still
+  on its way no longer brings back a signal the reset forgot. Changes from other hubs still apply.
+
 ## [0.6.1] - 2026-11-20
 
 ### Fixed
@@ -205,7 +212,8 @@ First release.
   than `queue_size` distinct keys or signals arrive during one read.
 - Python 3.11+, Postgres 14+, psycopg 3.
 
-[Unreleased]: https://github.com/sansanth/pg-sse/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/sansanth/pg-sse/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/sansanth/pg-sse/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/sansanth/pg-sse/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/sansanth/pg-sse/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/sansanth/pg-sse/compare/v0.4.0...v0.5.0
